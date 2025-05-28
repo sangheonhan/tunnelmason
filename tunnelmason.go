@@ -3,34 +3,43 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"golang.org/x/crypto/ssh"
 	"io"
 	"net"
 	"os"
+
+	"golang.org/x/crypto/ssh"
 )
 
 type Tunnel struct {
+	LocalHost  string `json:"local_host"`
 	LocalPort  int    `json:"local_port"`
 	RemoteHost string `json:"remote_host"`
 	RemotePort int    `json:"remote_port"`
 }
 
 type Config struct {
-	SSHServe  string   `json:"ssh_server"`
-	SSHPort   int      `json:"ssh_port"`
-	Username  string   `json:"username"`
-	SSHKey    string   `json:"ssh_key"`
-	Tunnels   []Tunnel `json:"tunnels"`
+	SSHServe string   `json:"ssh_server"`
+	SSHPort  int      `json:"ssh_port"`
+	Username string   `json:"username"`
+	SSHKey   string   `json:"ssh_key"`
+	Tunnels  []Tunnel `json:"tunnels"`
 }
 
-func forwardTunnel(localPort int, remoteHost string, remotePort int, sshClient *ssh.Client) {
-	local, err := net.Listen("tcp", fmt.Sprintf(":%d", localPort))
+func forwardTunnel(localHost string, localPort int, remoteHost string, remotePort int, sshClient *ssh.Client) {
+	// determine bind address
+	var bindAddr string
+	if localHost == "" {
+		bindAddr = fmt.Sprintf(":%d", localPort)
+	} else {
+		bindAddr = fmt.Sprintf("%s:%d", localHost, localPort)
+	}
+	local, err := net.Listen("tcp", bindAddr)
 	if err != nil {
 		fmt.Printf("Error: %v\n", err)
 		return
 	}
 	defer local.Close()
-	fmt.Printf("Listening on port %d for connections to %s:%d\n", localPort, remoteHost, remotePort)
+	fmt.Printf("Listening on %s for connections to %s:%d\n", bindAddr, remoteHost, remotePort)
 
 	for {
 		localConn, err := local.Accept()
@@ -99,8 +108,8 @@ func main() {
 	}
 
 	for _, tunnel := range config.Tunnels {
-		go forwardTunnel(tunnel.LocalPort, tunnel.RemoteHost, tunnel.RemotePort, sshClient)
+		go forwardTunnel(tunnel.LocalHost, tunnel.LocalPort, tunnel.RemoteHost, tunnel.RemotePort, sshClient)
 	}
 
-	select {}  // keep the main function alive
+	select {} // keep the main function alive
 }
