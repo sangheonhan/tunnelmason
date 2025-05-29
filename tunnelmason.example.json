@@ -1,0 +1,13 @@
+{
+    "ssh_server": "your-server",
+    "ssh_port": 22,
+    "username": "username",
+    "ssh_key": "/path/to/your/ssh/private_key",
+    "known_hosts_file": "/path/to/your/known_hosts",
+    "strict_host_key_check": true,
+    "tunnels": [
+        {"local_host": "192.168.1.100", "local_port": 80, "remote_host": "192.168.1.200", "remote_port": 9200},
+        {"local_host": "192.168.1.101", "local_port": 80, "remote_host": "192.168.1.201", "remote_port": 80},
+        {"local_port": 9200, "remote_host": "192.168.1.200", "remote_port": 9200}
+    ]
+}
