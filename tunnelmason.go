@@ -1,7 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"context"
+	"crypto/md5"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -10,12 +15,15 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 type Tunnel struct {
@@ -26,11 +34,13 @@ type Tunnel struct {
 }
 
 type Config struct {
-	SSHServer string   `json:"ssh_server"` // 오타 수정
-	SSHPort   int      `json:"ssh_port"`
-	Username  string   `json:"username"`
-	SSHKey    string   `json:"ssh_key"`
-	Tunnels   []Tunnel `json:"tunnels"`
+	SSHServer          string   `json:"ssh_server"`
+	SSHPort            int      `json:"ssh_port"`
+	Username           string   `json:"username"`
+	SSHKey             string   `json:"ssh_key"`
+	KnownHostsFile     string   `json:"known_hosts_file,omitempty"`
+	StrictHostKeyCheck bool     `json:"strict_host_key_check"`
+	Tunnels            []Tunnel `json:"tunnels"`
 }
 
 type TunnelManager struct {
@@ -56,12 +66,124 @@ func NewTunnelManager(configPath string) (*TunnelManager, error) {
 		return nil, fmt.Errorf("decoding config: %w", err)
 	}
 
+	if config.KnownHostsFile == "" {
+		homeDir, err := os.UserHomeDir()
+		if err == nil {
+			config.KnownHostsFile = filepath.Join(homeDir, ".ssh", "known_hosts")
+		}
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	return &TunnelManager{
 		config: config,
 		ctx:    ctx,
 		cancel: cancel,
 	}, nil
+}
+
+func loadKnownHosts(knownHostsFile string) (ssh.HostKeyCallback, error) {
+	if knownHostsFile == "" {
+		return nil, fmt.Errorf("known_hosts file path is empty")
+	}
+	hostKeyCallback, err := knownhosts.New(knownHostsFile)
+	if err != nil {
+		return nil, fmt.Errorf("loading known_hosts file %s: %w", knownHostsFile, err)
+	}
+
+	return hostKeyCallback, nil
+}
+
+func addHostKey(knownHostsFile, hostname string, port int, key ssh.PublicKey) error {
+	dir := filepath.Dir(knownHostsFile)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("creating directory %s: %w", dir, err)
+	}
+
+	file, err := os.OpenFile(knownHostsFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("opening known_hosts file: %w", err)
+	}
+	defer file.Close()
+
+	var hostEntry string
+	if port == 22 {
+		hostEntry = hostname
+	} else {
+		hostEntry = fmt.Sprintf("[%s]:%d", hostname, port)
+	}
+
+	line := fmt.Sprintf("%s %s %s\n", hostEntry, key.Type(), base64.StdEncoding.EncodeToString(key.Marshal()))
+	if _, err := file.WriteString(line); err != nil {
+		return fmt.Errorf("writing to known_hosts file: %w", err)
+	}
+
+	return nil
+}
+
+func getHostKeyFingerprint(key ssh.PublicKey) (string, string) {
+	hash := sha256.Sum256(key.Marshal())
+	sha256Fingerprint := "SHA256:" + base64.StdEncoding.EncodeToString(hash[:])
+
+	hash2 := md5.Sum(key.Marshal())
+	md5Fingerprint := "MD5:" + hex.EncodeToString(hash2[:])
+
+	return sha256Fingerprint, md5Fingerprint
+}
+
+func promptHostKeyApproval(hostname string, port int, key ssh.PublicKey) bool {
+	sha256Fp, md5Fp := getHostKeyFingerprint(key)
+
+	fmt.Printf("\nWARNING: The authenticity of host '%s' can't be established.\n", hostname)
+	fmt.Printf("%s key fingerprint is %s\n", key.Type(), sha256Fp)
+	fmt.Printf("%s key fingerprint is %s (legacy)\n", key.Type(), md5Fp)
+	fmt.Print("Are you sure you want to continue connecting? (yes/no): ")
+
+	reader := bufio.NewReader(os.Stdin)
+	response, err := reader.ReadString('\n')
+	if err != nil {
+		return false
+	}
+
+	response = strings.ToLower(strings.TrimSpace(response))
+	return response == "yes" || response == "y"
+}
+
+func (tm *TunnelManager) createHostKeyCallback() ssh.HostKeyCallback {
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		if tm.config.KnownHostsFile != "" {
+			hostKeyCallback, err := loadKnownHosts(tm.config.KnownHostsFile)
+			if err != nil {
+				log.Printf("Warning: Could not load known_hosts file: %v", err)
+			} else {
+				err = hostKeyCallback(hostname, remote, key)
+				if err == nil {
+					return nil
+				}
+
+				if tm.config.StrictHostKeyCheck {
+					return fmt.Errorf("host key verification failed: %w", err)
+				}
+			}
+		}
+
+		if !tm.config.StrictHostKeyCheck {
+			port := tm.config.SSHPort
+			if !promptHostKeyApproval(hostname, port, key) {
+				return fmt.Errorf("host key verification rejected by user")
+			}
+
+			if tm.config.KnownHostsFile != "" {
+				if err := addHostKey(tm.config.KnownHostsFile, hostname, port, key); err != nil {
+					log.Printf("Warning: Could not add key to known_hosts: %v", err)
+				} else {
+					log.Printf("Host key added to %s", tm.config.KnownHostsFile)
+				}
+			}
+			return nil
+		}
+
+		return fmt.Errorf("host key verification failed: unknown host")
+	}
 }
 
 func (tm *TunnelManager) setupIPs() error {
@@ -71,7 +193,7 @@ func (tm *TunnelManager) setupIPs() error {
 			if err != nil {
 				return fmt.Errorf("generating IP commands: %w", err)
 			}
-			
+
 			log.Printf("Adding IP address: %s", t.LocalHost)
 			if err := runCommand(add); err != nil {
 				return fmt.Errorf("adding IP %s: %w", t.LocalHost, err)
@@ -85,22 +207,19 @@ func (tm *TunnelManager) setupIPs() error {
 func (tm *TunnelManager) cleanup() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	
-	// 리스너들 정리
+
 	for _, listener := range tm.listeners {
 		if err := listener.Close(); err != nil {
 			log.Printf("Error closing listener: %v", err)
 		}
 	}
-	
-	// SSH 클라이언트 정리
+
 	if tm.sshClient != nil {
 		if err := tm.sshClient.Close(); err != nil {
 			log.Printf("Error closing SSH client: %v", err)
 		}
 	}
-	
-	// IP 주소들 제거
+
 	for _, cmd := range tm.delCmds {
 		log.Printf("Removing IP address")
 		if err := runCommand(cmd); err != nil {
@@ -125,18 +244,18 @@ func (tm *TunnelManager) connectSSH() error {
 		Auth: []ssh.AuthMethod{
 			ssh.PublicKeys(signer),
 		},
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(), // TODO: 프로덕션에서는 적절한 호스트 키 검증 필요
+		HostKeyCallback: tm.createHostKeyCallback(),
 		Timeout:         30 * time.Second,
 	}
 
 	addr := fmt.Sprintf("%s:%d", tm.config.SSHServer, tm.config.SSHPort)
 	log.Printf("Connecting to SSH server: %s", addr)
-	
+
 	sshClient, err := ssh.Dial("tcp", addr, sshConfig)
 	if err != nil {
 		return fmt.Errorf("SSH connection failed: %w", err)
 	}
-	
+
 	tm.sshClient = sshClient
 	return nil
 }
@@ -169,7 +288,7 @@ func (tm *TunnelManager) startTunnel(tunnel Tunnel) error {
 
 	tm.wg.Add(1)
 	go tm.handleTunnel(listener, tunnel)
-	
+
 	return nil
 }
 
@@ -187,7 +306,7 @@ func (tm *TunnelManager) handleTunnel(listener net.Listener, tunnel Tunnel) {
 		conn, err := listener.Accept()
 		if err != nil {
 			if tm.ctx.Err() != nil {
-				return // 컨텍스트가 취소된 경우
+				return
 			}
 			log.Printf("Accept error for tunnel %s:%d: %v", tunnel.LocalHost, tunnel.LocalPort, err)
 			continue
@@ -210,7 +329,6 @@ func (tm *TunnelManager) handleConnection(localConn net.Conn, tunnel Tunnel) {
 	}
 	defer remoteConn.Close()
 
-	// 양방향 데이터 복사
 	ctx, cancel := context.WithCancel(tm.ctx)
 	defer cancel()
 
@@ -222,8 +340,7 @@ func (tm *TunnelManager) handleConnection(localConn net.Conn, tunnel Tunnel) {
 
 func (tm *TunnelManager) copyData(ctx context.Context, dst, src net.Conn, cancel context.CancelFunc) {
 	defer cancel()
-	
-	// 타임아웃 설정
+
 	if tcpConn, ok := src.(*net.TCPConn); ok {
 		tcpConn.SetKeepAlive(true)
 		tcpConn.SetKeepAlivePeriod(30 * time.Second)
@@ -236,32 +353,26 @@ func (tm *TunnelManager) copyData(ctx context.Context, dst, src net.Conn, cancel
 }
 
 func (tm *TunnelManager) Run() error {
-	// IP 주소 설정
 	if err := tm.setupIPs(); err != nil {
 		return err
 	}
 
-	// SSH 연결
 	if err := tm.connectSSH(); err != nil {
 		return err
 	}
 
-	// 터널 시작
 	if err := tm.startTunnels(); err != nil {
 		return err
 	}
 
-	// 시그널 처리
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	log.Println("Tunnel manager started. Press Ctrl+C to stop.")
 
-	// 시그널 대기
 	<-sigChan
 	log.Println("Shutting down...")
 
-	// 정리 작업
 	tm.cancel()
 	tm.cleanup()
 	tm.wg.Wait()
@@ -270,7 +381,6 @@ func (tm *TunnelManager) Run() error {
 	return nil
 }
 
-// 기존 유틸리티 함수들 (개선된 버전)
 func ipExists(ip string) bool {
 	ifaces, err := net.Interfaces()
 	if err != nil {
@@ -294,7 +404,7 @@ func ipExists(ip string) bool {
 func generateCommands(ip string) ([]string, []string, error) {
 	var iface string
 	var addCmd, delCmd []string
-	
+
 	switch runtime.GOOS {
 	case "linux":
 		iface = "lo"
@@ -319,7 +429,7 @@ func runCommand(cmd []string) error {
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
-	
+
 	configFile := "tunnelmason.json"
 	if len(os.Args) > 1 {
 		configFile = os.Args[1]
